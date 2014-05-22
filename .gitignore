@@ -2,4 +2,9 @@ env
 *.png
 *.gif
 *.jpg
+cabal.sandbox.config
+.cabal-sandbox
+*.swp
+dist
+.DS_Store
 
