@@ -5,21 +5,27 @@
 
 module Main where
 
-import Codec.Picture (writePng, generateImage, PixelRGB8(..))
-import qualified Codec.Picture.Types
-import Codec.Picture.Repa ( readImageRGBA, imgData, collapseColorChannel
-                          , imgToImage, onImg)
+import           Codec.Picture               hiding (Image)
+import           Codec.Picture.Repa          (readImageRGBA)
+import           Codec.Picture.Repa          (collapseColorChannel)
+import qualified Codec.Picture.Types         as JuicyPixels
 
-import Prelude hiding (map, replicate, sum)
-import Data.Array.Repa hiding ((!), map, (++))
-import Data.Array.Repa.Repr.ForeignPtr (F)
-import Data.Vector.Unboxed hiding (maximum, unsafeIndex, (++), take, zip, forM_)
-import Data.Vector.Unboxed.Mutable (write)
+import           Data.Array.Repa             (Array, Source, D, U)
+import           Data.Array.Repa             (computeP, computeS, delay)
+import           Data.Array.Repa             (extent, size, extract)
+import           Data.Array.Repa             (fromFunction, unsafeIndex)
+import           Data.Array.Repa             (toUnboxed)
+import           Data.Array.Repa.Index
+import           Data.Array.Repa.Unsafe
 
-import Control.Monad (forM_)
-import Data.Functor.Identity
-import Data.Word (Word8)
-import System.Environment (getArgs)
+import           Data.Vector.Unboxed         (Vector, (!), modify, ifoldl')
+import qualified Data.Vector.Unboxed         as Vector
+import           Data.Vector.Unboxed.Mutable (write)
+
+import           Control.Monad               (forM_)
+import           Data.Functor.Identity       (Identity(..))
+import           Data.Word                   (Word8)
+import           System.Environment          (getArgs)
 
 data Quad = Quad { ul :: Quad, ule :: Error
                  , ur :: Quad, ure :: Error
@@ -51,14 +57,23 @@ writeImage filename r = writePng filename $ image
 
 iterator a = fst . iterateQuad a
 
-jpSaveHack :: Image U -> Codec.Picture.Types.Image PixelRGB8
+jpSaveHack :: Image U -> JuicyPixels.Image PixelRGB8
 jpSaveHack a = generateImage fnElem x y
-    where (Z :. y :. x) = extent a
-          fnElem i j = (\(r, g, b) -> PixelRGB8 r g b) $ a `unsafeIndex` (Z :. j :. i)
+    where
+          (Z :. y :. x) = extent a
+          
+          fnElem i j = toPixel $ a `unsafeIndex` (Z :. j :. i)
+            where
+                  toPixel (r, g, b) = PixelRGB8 r g b
+                  {-# INLINE toPixel #-}
+          {-# INLINE fnElem #-}
 
 histogram :: Image U -> Histogram
-histogram = foldl' addToHist histZero . toUnboxed
-    where histZero = (replicate 256 0, replicate 256 0, replicate 256 0)
+histogram = Vector.foldl' addToHist histZero . toUnboxed
+    where
+          channelZero = Vector.replicate 256 0
+          histZero = (channelZero, channelZero, channelZero)
+          
           addToHist (!histr, !histg, !histb) (wr, wg, wb) =
               ( modify (\v -> write v r (histr ! r + 1)) histr
               , modify (\v -> write v g (histb ! g + 1)) histg
@@ -70,7 +85,7 @@ histogram = foldl' addToHist histZero . toUnboxed
 weightedAverage :: Vector Int -> (Channel, Error)
 weightedAverage hist | total == 0 = (0, 0) 
                      | otherwise  = (fromIntegral value, error)
-    where total = sum hist
+    where total = Vector.sum hist
           value = ifoldl' (\a i x -> a + i * x) 0 hist `div` total
           error = sqrt (fromIntegral (ifoldl' (\a i x -> a + err i x) 0 hist)
                         / fromIntegral total)
@@ -89,8 +104,10 @@ split a (Leaf (Z :. y :. x) (Z :. j :. i) _) =
         ( Quad ull ulle url urle
                bll blle brl brle
         , maximum [ulle, urle, blle, brle] )
-    where i' = i `div` 2
+    where
+          i' = i `div` 2
           j' = j `div` 2
+          
           (ull, ulle) = leaf a (Z :. y      :. x     ) (Z :.     j' :.     i')
           (url, urle) = leaf a (Z :. y      :. x + i') (Z :.     j' :. i - i')
           (bll, blle) = leaf a (Z :. y + j' :. x     ) (Z :. j - j' :.     i')
@@ -98,8 +115,10 @@ split a (Leaf (Z :. y :. x) (Z :. j :. i) _) =
 
 leaf :: (Source r Color) => Image r -> DIM2 -> DIM2 -> (Quad, Error)
 leaf a start dim = (Leaf start dim color, weight dim error)
-    where (color, error) = averageColor . histogram . computeS
+    where
+          (color, error) = averageColor . histogram . computeS
                          $ extract start dim a
+          
           weight sh e = e * fromIntegral (size sh) ** 0.25
 
 iterateQuad :: (Source r Color) => Image r -> Quad -> (Quad, Error)
@@ -115,13 +134,15 @@ iterateQuad a q@Quad{..} | isMax ule = let (newq, newe) = iterateQuad a ul
                          | isMax bre = let (newq, newe) = iterateQuad a br
                                            maxe = maximum [ule, ure, ble, newe]
                                        in (q{br = newq, bre = newe}, maxe)
-    where isMax e = e == maximum [ule, ure, ble, bre]
+    where
+          isMax e = e == maximum [ule, ure, ble, bre]
 iterateQuad a l = split a l
 
 quadpend :: (Source r Color, Source s Color, Source t Color, Source u Color)
          => Image r -> Image s -> Image t -> Image u -> Image D
-quadpend a1 a2 a3 a4 = traverse4 a1 a2 a3 a4 fnExtent fnElem
-    where (Z :. y :. x) = extent a1
+quadpend a1 a2 a3 a4 = unsafeTraverse4 a1 a2 a3 a4 fnExtent fnElem
+    where
+          (Z :. y :. x) = extent a1
           
           fnExtent (Z :. j :. i) _ _ (Z :. j' :. i') = Z :. j + j' :. i + i'
           
@@ -135,7 +156,8 @@ quadpend a1 a2 a3 a4 = traverse4 a1 a2 a3 a4 fnExtent fnElem
 renderQuad :: (Source r Color) => (Quad -> Image r) -> Quad -> Image D
 renderQuad style (Quad ulq _ urq _ blq _ brq _) =
         quadpend ula ura bla bra
-    where ula = renderQuad style ulq
+    where
+          ula = renderQuad style ulq
           ura = renderQuad style urq
           bla = renderQuad style blq
           bra = renderQuad style brq
@@ -149,7 +171,8 @@ blockStyle (Leaf _ sh color) = fromFunction sh (const color)
 
 uncollapseColorChannel :: (Source r Color) => Image r -> Array D DIM3 Channel
 uncollapseColorChannel a = fromFunction (extent a :. 4) fnElem
-    where fnElem (sh :. c) | c == 0 = (\(r, _, _) -> r) (a `unsafeIndex` sh)
+    where
+          fnElem (sh :. c) | c == 0 = (\(r, _, _) -> r) (a `unsafeIndex` sh)
                            | c == 1 = (\(_, g, _) -> g) (a `unsafeIndex` sh)
                            | c == 2 = (\(_, _, b) -> b) (a `unsafeIndex` sh)
                            | otherwise = 0
